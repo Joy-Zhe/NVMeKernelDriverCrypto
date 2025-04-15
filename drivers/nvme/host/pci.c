@@ -922,6 +922,129 @@ out_free_cmd:
 	return ret;
 }
 
+static void debug_print_data_page(void *buf, const char *s) {
+	const size_t chunk_size = 64; // 每次打印64字节，减少printk调用次数
+    unsigned char *ptr = (unsigned char *)buf;
+    size_t total_printed = 0;
+    
+    // 打印页头信息
+    printk(KERN_INFO "===== 4KB Page Dump at %s =====\n", s);
+
+    // 分块打印以避免日志截断
+    while (total_printed < PAGE_SIZE) {
+        size_t remaining = PAGE_SIZE - total_printed;
+        size_t print_size = min(remaining, chunk_size);
+
+        // 使用内核内置的十六进制打印函数
+        print_hex_dump(KERN_INFO, "", DUMP_PREFIX_OFFSET,
+                       16, 1, // 每行16字节，1字节对齐
+                       ptr + total_printed,
+                       print_size, 
+                       true); // ASCII显示
+
+        total_printed += print_size;
+
+        // 防止CPU被长时间占用
+        cond_resched();
+    }
+
+    printk(KERN_INFO "===== End of Page Dump =====\n");
+}
+
+static int encrypt_data_page(void *buf) {
+	int ret = -1;
+	char *ptr = (char *)buf;
+	size_t i = 0;
+	for (i = 0; i < 4096; i++) {
+		ptr[i] ^= 0x55;
+	}
+	ret = 0;
+	return ret;
+}
+
+static int decrypt_data_page(void *buf) {
+	int ret = -1;
+	char *ptr = (char *)buf;
+	size_t i = 0;
+	for (i = 0; i < 4096; i++) {
+		ptr[i] ^= 0x55;
+	}
+	ret = 0;
+	return ret;
+}
+
+static int encrypt_prp_traversal(union nvme_data_ptr *dptr) {
+	int ret = -1;
+	const int page_size = 4096;
+
+	// PRP1 encrypt
+	// PRP1 mem copy
+	dma_addr_t new_buf_addr;
+	void *old_buf = phys_to_virt(dptr->prp1);
+	void *new_buf = dma_alloc_coherent(NULL, page_size, &new_buf_addr, GFP_KERNEL);
+	memcpy(new_buf, old_buf, page_size);
+	// new buffer encrypt
+	printk("----------ENCRYPT START-----------\n");
+	debug_print_data_page(old_buf, "write origin PRP1 page");
+	encrypt_data_page(new_buf);
+	printk("-----------ENCRYPT END------------\n");
+	// end buffer encrypt
+	dptr->prp1 = new_buf_addr;
+	ret = 0;
+
+out_free:
+	return ret;
+}
+
+static int nvme_write_data_encrypt(struct nvme_iod *iod) {
+	// struct nvme_command cmnd = iod->cmd;
+	// struct nvme_request req = iod->req;
+	union nvme_data_ptr *dptr = &iod->cmd.rw.dptr;
+	
+	if (iod->use_sgl) {
+		// SGL traversal
+	} else {
+		// PRP traversal
+		encrypt_prp_traversal(dptr);
+	}
+	return 0;
+}
+
+static int decrypt_prp_traversal(union nvme_data_ptr *dptr) {
+	int ret = -1;
+	void *old_buf;
+	dma_addr_t new_buf_addr;
+	void *new_buf;
+	printk("------READ DECRYPTION START------\n");
+	printk("PAGE_SIZE MACRO: %d", PAGE_SIZE);
+	// PRP1 decrypt
+	// PRP1 mem copy
+	old_buf = phys_to_virt(dptr->prp1);
+	new_buf = dma_alloc_coherent(NULL, PAGE_SIZE, &new_buf_addr, GFP_KERNEL);
+	memcpy(new_buf, old_buf, PAGE_SIZE);
+	// decryption
+	decrypt_data_page(new_buf);
+	// end decryption
+	dptr->prp1 = new_buf_addr;
+	printk("-------READ DECRYPTION END-------\n");
+	return ret;
+}
+
+static int nvme_read_data_decrypt(struct nvme_iod *iod) {
+	// struct nvme_command cmnd = iod->cmd;
+	// struct nvme_request req = iod->req;
+	union nvme_data_ptr *dptr = &iod->cmd.rw.dptr;
+
+	if (iod->use_sgl) {
+		// SGL traversal
+	} else {
+		// PPR traversal
+		decrypt_prp_traversal(dptr);
+	}
+
+	return 0;
+}
+
 /*
  * NOTE: ns is NULL when called on the admin queue.
  */
@@ -948,6 +1071,18 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (unlikely(ret))
 		return ret;
 	spin_lock(&nvmeq->sq_lock);
+
+	// add encrypto and decrypto logic
+	if (nvmeq->qid > 0) { // nvme I/O command, skip nvme admin command
+		if (iod->cmd.rw.opcode == nvme_cmd_write) { // write command, encrypt
+			nvme_write_data_encrypt(iod);
+		} 
+		// else if (iod->cmd.rw.opcode == nvme_cmd_read) { // read command, decrypt
+		// 	nvme_read_data_decrypt(iod);
+		// }
+	}
+	// end additional logic
+
 	nvme_sq_copy_cmd(nvmeq, &iod->cmd);
 	nvme_write_sq_db(nvmeq, bd->last);
 	spin_unlock(&nvmeq->sq_lock);
@@ -958,12 +1093,27 @@ static void nvme_pci_complete_rq(struct request *req)
 {
 	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
 	struct nvme_dev *dev = nvmeq->dev;
+	struct nvme_iod *n_iod;
 
 	if (blk_integrity_rq(req)) {
 	        struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 
 		dma_unmap_page(dev->dev, iod->meta_dma,
 			       rq_integrity_vec(req)->bv_len, rq_dma_dir(req));
+	}
+	// NVMe DMA engine processing finished
+	// decrypt data
+	if (nvmeq->qid > 0) {
+		// 有问题，install module的时候就进入了这里，明明加了admin command判断
+		// printk("----------TRY GET IOD------------\nnvme_pci_complete_rq\n");
+		n_iod = blk_mq_rq_to_pdu(req);
+		if (n_iod->cmd.rw.opcode == nvme_cmd_read) {
+			printk("READ: %d\n", nvmeq->qid);
+		} else {
+			printk("NOT READ.\n");
+		}
+		// nvme_read_data_decrypt(n_iod);
+		// printk("--------END READ LOGIC-----------\n");
 	}
 
 	if (blk_rq_nr_phys_segments(req))

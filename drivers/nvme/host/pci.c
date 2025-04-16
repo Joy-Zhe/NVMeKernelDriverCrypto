@@ -973,54 +973,63 @@ static int decrypt_data_page(void *buf) {
 	return ret;
 }
 
-static int encrypt_prp_traversal(union nvme_data_ptr *dptr) {
+static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev) {
 	int ret = -1;
 	const int page_size = 4096;
-
 	// PRP1 encrypt
 	// PRP1 mem copy
 	dma_addr_t new_buf_addr;
 	void *old_buf = phys_to_virt(dptr->prp1);
-	void *new_buf = dma_alloc_coherent(NULL, page_size, &new_buf_addr, GFP_KERNEL);
+	void *new_buf = dma_alloc_coherent(dev->dev, page_size, &new_buf_addr, GFP_KERNEL);
+	if (!new_buf) {
+		printk("dma_alloc failed!\n");
+		return -ENOMEM;
+	}
 	memcpy(new_buf, old_buf, page_size);
 	// new buffer encrypt
 	printk("----------ENCRYPT START-----------\n");
-	debug_print_data_page(old_buf, "write origin PRP1 page");
+	// debug_print_data_page(old_buf, "write origin PRP1 page");
 	encrypt_data_page(new_buf);
 	printk("-----------ENCRYPT END------------\n");
 	// end buffer encrypt
 	dptr->prp1 = new_buf_addr;
 	ret = 0;
+	// PRP2
+
 
 out_free:
 	return ret;
 }
 
-static int nvme_write_data_encrypt(struct nvme_iod *iod) {
+static int nvme_write_data_encrypt(struct nvme_iod *iod, struct nvme_dev *dev) {
 	// struct nvme_command cmnd = iod->cmd;
 	// struct nvme_request req = iod->req;
 	union nvme_data_ptr *dptr = &iod->cmd.rw.dptr;
-	
+	printk("====nvme_write_data_encrypt====\n");
 	if (iod->use_sgl) {
 		// SGL traversal
 	} else {
 		// PRP traversal
-		encrypt_prp_traversal(dptr);
+		encrypt_prp_traversal(dptr, dev);
 	}
 	return 0;
 }
 
-static int decrypt_prp_traversal(union nvme_data_ptr *dptr) {
+static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev) {
 	int ret = -1;
 	void *old_buf;
 	dma_addr_t new_buf_addr;
 	void *new_buf;
 	printk("------READ DECRYPTION START------\n");
-	printk("PAGE_SIZE MACRO: %d", PAGE_SIZE);
+	// printk("PAGE_SIZE MACRO: %d", PAGE_SIZE);
 	// PRP1 decrypt
 	// PRP1 mem copy
 	old_buf = phys_to_virt(dptr->prp1);
-	new_buf = dma_alloc_coherent(NULL, PAGE_SIZE, &new_buf_addr, GFP_KERNEL);
+	new_buf = dma_alloc_coherent(dev->dev, PAGE_SIZE, &new_buf_addr, GFP_KERNEL);
+	if (!new_buf) {
+		printk("dma_alloc_coherent failed!\n");
+		return -ENOMEM;
+	}
 	memcpy(new_buf, old_buf, PAGE_SIZE);
 	// decryption
 	decrypt_data_page(new_buf);
@@ -1030,7 +1039,7 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr) {
 	return ret;
 }
 
-static int nvme_read_data_decrypt(struct nvme_iod *iod) {
+static int nvme_read_data_decrypt(struct nvme_iod *iod, struct nvme_dev *dev) {
 	// struct nvme_command cmnd = iod->cmd;
 	// struct nvme_request req = iod->req;
 	union nvme_data_ptr *dptr = &iod->cmd.rw.dptr;
@@ -1039,7 +1048,7 @@ static int nvme_read_data_decrypt(struct nvme_iod *iod) {
 		// SGL traversal
 	} else {
 		// PPR traversal
-		decrypt_prp_traversal(dptr);
+		decrypt_prp_traversal(dptr, dev);
 	}
 
 	return 0;
@@ -1075,7 +1084,9 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	// add encrypto and decrypto logic
 	if (nvmeq->qid > 0) { // nvme I/O command, skip nvme admin command
 		if (iod->cmd.rw.opcode == nvme_cmd_write) { // write command, encrypt
-			nvme_write_data_encrypt(iod);
+			printk("====Write Data ENCRYPT====\n");
+			nvme_write_data_encrypt(iod, dev);
+			printk("====Write Data ENCRYPT====\n");
 		} 
 		// else if (iod->cmd.rw.opcode == nvme_cmd_read) { // read command, decrypt
 		// 	nvme_read_data_decrypt(iod);

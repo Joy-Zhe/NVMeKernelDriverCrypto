@@ -159,6 +159,16 @@ struct nvme_dev {
 	unsigned int nr_poll_queues;
 
 	bool attrs_added;
+
+	//// TODO ////
+	// // add my own dma_pool
+	// struct dma_pool *encrypt_pool;
+	// __le64 **virt_addr_list;  // virtual address list in encrypt pool, for pool free 
+	// u64 virt_list_cnt;
+	// global dma buffer
+	void **dma_virt_list;
+	dma_addr_t *dma_phys_list;
+	int dma_allocated;
 };
 
 static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
@@ -922,6 +932,8 @@ out_free_cmd:
 	return ret;
 }
 
+//// TODO ////
+// debug, crypto page printing
 static void debug_print_data_page(void *buf, const char *s) {
 	const size_t chunk_size = 64; // 每次打印64字节，减少printk调用次数
     unsigned char *ptr = (unsigned char *)buf;
@@ -951,6 +963,8 @@ static void debug_print_data_page(void *buf, const char *s) {
     printk(KERN_INFO "===== End of Page Dump =====\n");
 }
 
+//// TODO ////
+// for PRP, encrypt each 4KB page
 static int encrypt_data_page(void *buf) {
 	int ret = -1;
 	char *ptr = (char *)buf;
@@ -962,6 +976,8 @@ static int encrypt_data_page(void *buf) {
 	return ret;
 }
 
+//// TODO ////
+// for PRP, decrypt each 4KB page
 static int decrypt_data_page(void *buf) {
 	int ret = -1;
 	char *ptr = (char *)buf;
@@ -973,35 +989,57 @@ static int decrypt_data_page(void *buf) {
 	return ret;
 }
 
-static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev) {
+//// TODO //// 
+// encrypt PRP traversal
+static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev, u16 qid) {
 	int ret = -1;
 	const int page_size = 4096;
 	// PRP1 encrypt
 	// PRP1 mem copy
 	dma_addr_t new_buf_addr;
 	void *old_buf = phys_to_virt(dptr->prp1);
-	void *new_buf = dma_alloc_coherent(dev->dev, page_size, &new_buf_addr, GFP_KERNEL);
-	if (!new_buf) {
-		printk("dma_alloc failed!\n");
+	// void *new_buf;
+	// void *new_buf = dma_alloc_coherent(dev->dev, page_size, &new_buf_addr, GFP_KERNEL);
+	// int new_prp1 = dma_pool_alloc(dev->encrypt_pool, GFP_ATOMIC, &new_buf_addr);
+	
+	// if (!new_prp1) {
+	// 	printk("dma_alloc failed!\n");
+	// 	return -ENOMEM;
+	// }
+	// new_buf = phys_to_virt(new_buf_addr);
+	// dev->virt_addr_list[dev->virt_list_cnt++] = new_buf; // append new buf, for pool free's virt addr param
+	// memcpy(new_buf, old_buf, page_size);
+	if (dev->dma_virt_list[qid]) {
+		memcpy(dev->dma_virt_list[qid], old_buf, page_size);
+	}
+	else {
 		return -ENOMEM;
 	}
-	memcpy(new_buf, old_buf, page_size);
 	// new buffer encrypt
 	printk("----------ENCRYPT START-----------\n");
 	// debug_print_data_page(old_buf, "write origin PRP1 page");
-	encrypt_data_page(new_buf);
-	printk("-----------ENCRYPT END------------\n");
+	encrypt_data_page(dev->dma_virt_list[qid]);
 	// end buffer encrypt
-	dptr->prp1 = new_buf_addr;
+	printk("Old PRP1: %x, New PRP1: %x\n", dptr->prp1, dev->dma_phys_list[qid]);
+	// 直接调用dma_pool_free，把旧内存释放了，防止内存泄漏，但是需要判断一下是哪个pool
+	// 针对PRP List，只有两种Pool，一种是prp_page_pool，另一种是prp_small_pool，根据npage来确定
+	// if () {
+	
+	// }
+	// dma_pool_free(dev->prp_page_pool, , dptr->prp1);
+	dptr->prp1 = dev->dma_phys_list[qid]; // update PRP1
+	printk("-----------ENCRYPT END------------\n");
 	ret = 0;
+	// dma_free_coherent(dev->dev, page_size, new_buf, new_buf_addr);
 	// PRP2
 
-
-out_free:
+// out_free:
 	return ret;
 }
 
-static int nvme_write_data_encrypt(struct nvme_iod *iod, struct nvme_dev *dev) {
+//// TODO //// 
+// write data encrypt
+static int nvme_write_data_encrypt(struct nvme_iod *iod, struct nvme_dev *dev, u16 qid) {
 	// struct nvme_command cmnd = iod->cmd;
 	// struct nvme_request req = iod->req;
 	union nvme_data_ptr *dptr = &iod->cmd.rw.dptr;
@@ -1010,11 +1048,13 @@ static int nvme_write_data_encrypt(struct nvme_iod *iod, struct nvme_dev *dev) {
 		// SGL traversal
 	} else {
 		// PRP traversal
-		encrypt_prp_traversal(dptr, dev);
+		encrypt_prp_traversal(dptr, dev, qid);
 	}
 	return 0;
 }
 
+//// TODO //// 
+// for read data PRP traversal
 static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev) {
 	int ret = -1;
 	void *old_buf;
@@ -1039,6 +1079,8 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	return ret;
 }
 
+//// TODO ////
+// read data decrypt
 static int nvme_read_data_decrypt(struct nvme_iod *iod, struct nvme_dev *dev) {
 	// struct nvme_command cmnd = iod->cmd;
 	// struct nvme_request req = iod->req;
@@ -1065,6 +1107,7 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct request *req = bd->rq;
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	blk_status_t ret;
+	// struct dma_pool *encrypt_data_pool;
 
 	/*
 	 * We should not need to do this, but we're still using this to
@@ -1081,11 +1124,14 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return ret;
 	spin_lock(&nvmeq->sq_lock);
 
+	//// TODO ////
 	// add encrypto and decrypto logic
+	// dev->encrypt_pool = dma_pool_create("Encrypt Data Pool", dev->dev, 4096, 4096, 0); // use dma pool to manage encrypto buffer
+	// dev->virt_list_cnt = 0; // reset cnt
 	if (nvmeq->qid > 0) { // nvme I/O command, skip nvme admin command
 		if (iod->cmd.rw.opcode == nvme_cmd_write) { // write command, encrypt
 			printk("====Write Data ENCRYPT====\n");
-			nvme_write_data_encrypt(iod, dev);
+			nvme_write_data_encrypt(iod, dev, nvmeq->qid);
 			printk("====Write Data ENCRYPT====\n");
 		} 
 		// else if (iod->cmd.rw.opcode == nvme_cmd_read) { // read command, decrypt
@@ -1105,6 +1151,7 @@ static void nvme_pci_complete_rq(struct request *req)
 	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
 	struct nvme_dev *dev = nvmeq->dev;
 	struct nvme_iod *n_iod;
+	size_t i;
 
 	if (blk_integrity_rq(req)) {
 	        struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
@@ -1114,16 +1161,29 @@ static void nvme_pci_complete_rq(struct request *req)
 	}
 	// NVMe DMA engine processing finished
 	// decrypt data
+	//// TODO ////
 	if (nvmeq->qid > 0) {
-		// 有问题，install module的时候就进入了这里，明明加了admin command判断
+		// 在NVMe命令的末尾，会产生一些I/O读请求，需要对这些读请求进行跳过，防止错误的解密
 		// printk("----------TRY GET IOD------------\nnvme_pci_complete_rq\n");
 		n_iod = blk_mq_rq_to_pdu(req);
 		if (n_iod->cmd.rw.opcode == nvme_cmd_read) {
-			printk("READ: %d\n", nvmeq->qid);
+			//// TODO ////
+			// 在这里对IO读请求进行bypass
+			printk("READ QID: %d\n", nvmeq->qid);
+			if (/*跳过额外的IO读*/1) {
+				
+			} else { // 正常解密
+				// 已经在rq阶段了，不如在新buf中处理完，直接把数据覆盖到原先的buf中
+				// nvme_read_data_decrypt(n_iod, dev);
+			}
 		} else {
-			printk("NOT READ.\n");
+			//// TODO ////
+			// 在这里处理IO写请求，根据command_id，对之前请求的空间进行释放
+			printk("WRITE QID: %d\n", nvmeq->qid);
+			// for (i = 0; i < dev->virt_list_cnt; i++) {
+			// 	// dma_pool_free(dev->encrypt_pool, dev->virt_addr_list[i], /*PRP Addr*/);
+			// }
 		}
-		// nvme_read_data_decrypt(n_iod);
 		// printk("--------END READ LOGIC-----------\n");
 	}
 
@@ -3218,6 +3278,12 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct nvme_dev *dev;
 	int result = -ENOMEM;
 
+	//// TODO ////
+	// params
+	int block_nums = 128;
+	int block_size = 4096;
+	size_t i = 0;
+
 	dev = nvme_pci_alloc_dev(pdev, id);
 	if (IS_ERR(dev))
 		return PTR_ERR(dev);
@@ -3239,6 +3305,28 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	nvme_reset_ctrl(&dev->ctrl);
 	async_schedule(nvme_async_probe, dev);
+
+	//// TODO ////
+	// allocate global buffer for each queue ectrypt
+	dev->dma_virt_list = kcalloc(block_nums, sizeof(void*), GFP_KERNEL);
+	if (!dev->dma_virt_list) {
+		printk("DMA VIRT alloc failed.\n");
+		return -ENOMEM;
+	}
+	dev->dma_phys_list = kcalloc(block_nums, sizeof(dma_addr_t), GFP_KERNEL);
+	if (!dev->dma_phys_list) {
+		printk("DMA PHYS alloc failed.\n");
+		return -ENOMEM;
+	}
+	for (i = 0; i < block_nums; i++) {
+		dev->dma_virt_list[i] = dma_alloc_coherent(dev->dev, block_size, &dev->dma_phys_list[i], GFP_KERNEL);
+		if (!dev->dma_virt_list[i]) {
+			printk("DMA VIRT [%d] alloc failed.\n", i);
+			return -ENOMEM;
+		}
+	}
+	dev->dma_allocated = block_nums;
+
 	return 0;
 
 out_release_prp_pools:
@@ -3294,6 +3382,10 @@ static void nvme_remove(struct pci_dev *pdev)
 {
 	struct nvme_dev *dev = pci_get_drvdata(pdev);
 
+	//// TODO ////
+	const int block_size = 4096;
+	size_t i = 0;
+
 	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DELETING);
 	pci_set_drvdata(pdev, NULL);
 
@@ -3301,6 +3393,21 @@ static void nvme_remove(struct pci_dev *pdev)
 		nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DEAD);
 		nvme_dev_disable(dev, true);
 	}
+
+	//// TODO ////
+	// free global buffer
+	if (dev->dma_phys_list && dev->dma_virt_list) {
+		for (i = 0; i < dev->dma_allocated; i++) {
+			if (dev->dma_virt_list[i]) {
+				dma_free_coherent(dev->dev, block_size, dev->dma_virt_list[i], dev->dma_phys_list[i]);
+				dev->dma_virt_list[i] = NULL;
+			}
+		}	
+	}
+
+	kfree(dev->dma_phys_list);
+	kfree(dev->dma_virt_list);
+	// free done
 
 	flush_work(&dev->ctrl.reset_work);
 	nvme_stop_ctrl(&dev->ctrl);

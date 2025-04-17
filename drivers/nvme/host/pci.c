@@ -996,19 +996,7 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	const int page_size = 4096;
 	// PRP1 encrypt
 	// PRP1 mem copy
-	dma_addr_t new_buf_addr;
 	void *old_buf = phys_to_virt(dptr->prp1);
-	// void *new_buf;
-	// void *new_buf = dma_alloc_coherent(dev->dev, page_size, &new_buf_addr, GFP_KERNEL);
-	// int new_prp1 = dma_pool_alloc(dev->encrypt_pool, GFP_ATOMIC, &new_buf_addr);
-	
-	// if (!new_prp1) {
-	// 	printk("dma_alloc failed!\n");
-	// 	return -ENOMEM;
-	// }
-	// new_buf = phys_to_virt(new_buf_addr);
-	// dev->virt_addr_list[dev->virt_list_cnt++] = new_buf; // append new buf, for pool free's virt addr param
-	// memcpy(new_buf, old_buf, page_size);
 	if (dev->dma_virt_list[qid]) {
 		memcpy(dev->dma_virt_list[qid], old_buf, page_size);
 	}
@@ -1021,17 +1009,9 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	encrypt_data_page(dev->dma_virt_list[qid]);
 	// end buffer encrypt
 	printk("Old PRP1: %x, New PRP1: %x\n", dptr->prp1, dev->dma_phys_list[qid]);
-	// 直接调用dma_pool_free，把旧内存释放了，防止内存泄漏，但是需要判断一下是哪个pool
-	// 针对PRP List，只有两种Pool，一种是prp_page_pool，另一种是prp_small_pool，根据npage来确定
-	// if () {
-	
-	// }
-	// dma_pool_free(dev->prp_page_pool, , dptr->prp1);
 	dptr->prp1 = dev->dma_phys_list[qid]; // update PRP1
 	printk("-----------ENCRYPT END------------\n");
 	ret = 0;
-	// dma_free_coherent(dev->dev, page_size, new_buf, new_buf_addr);
-	// PRP2
 
 // out_free:
 	return ret;
@@ -1055,33 +1035,34 @@ static int nvme_write_data_encrypt(struct nvme_iod *iod, struct nvme_dev *dev, u
 
 //// TODO //// 
 // for read data PRP traversal
-static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev) {
+static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev, u16 qid) {
 	int ret = -1;
 	void *old_buf;
-	dma_addr_t new_buf_addr;
-	void *new_buf;
+	const int page_size = 4096;
 	printk("------READ DECRYPTION START------\n");
 	// printk("PAGE_SIZE MACRO: %d", PAGE_SIZE);
 	// PRP1 decrypt
 	// PRP1 mem copy
 	old_buf = phys_to_virt(dptr->prp1);
-	new_buf = dma_alloc_coherent(dev->dev, PAGE_SIZE, &new_buf_addr, GFP_KERNEL);
-	if (!new_buf) {
-		printk("dma_alloc_coherent failed!\n");
-		return -ENOMEM;
-	}
-	memcpy(new_buf, old_buf, PAGE_SIZE);
+	// new_buf = dma_alloc_coherent(dev->dev, PAGE_SIZE, &new_buf_addr, GFP_KERNEL);
+	// if (!new_buf) {
+	// 	printk("dma_alloc_coherent failed!\n");
+	// 	return -ENOMEM;
+	// }
+	// memcpy(new_buf, old_buf, PAGE_SIZE);
+	memcpy(dev->dma_virt_list[qid], old_buf, page_size);
 	// decryption
-	decrypt_data_page(new_buf);
+	decrypt_data_page(dev->dma_virt_list[qid]);
 	// end decryption
-	dptr->prp1 = new_buf_addr;
+	printk("Old PRP1: %d, New PRP1: %d\n", dptr->prp1, dev->dma_phys_list[qid]);
+	dptr->prp1 = dev->dma_phys_list[qid];
 	printk("-------READ DECRYPTION END-------\n");
 	return ret;
 }
 
 //// TODO ////
 // read data decrypt
-static int nvme_read_data_decrypt(struct nvme_iod *iod, struct nvme_dev *dev) {
+static int nvme_read_data_decrypt(struct nvme_iod *iod, struct nvme_dev *dev, u16 qid) {
 	// struct nvme_command cmnd = iod->cmd;
 	// struct nvme_request req = iod->req;
 	union nvme_data_ptr *dptr = &iod->cmd.rw.dptr;
@@ -1090,7 +1071,7 @@ static int nvme_read_data_decrypt(struct nvme_iod *iod, struct nvme_dev *dev) {
 		// SGL traversal
 	} else {
 		// PPR traversal
-		decrypt_prp_traversal(dptr, dev);
+		decrypt_prp_traversal(dptr, dev, qid);
 	}
 
 	return 0;
@@ -1170,12 +1151,12 @@ static void nvme_pci_complete_rq(struct request *req)
 			//// TODO ////
 			// 在这里对IO读请求进行bypass
 			printk("READ QID: %d\n", nvmeq->qid);
-			if (/*跳过额外的IO读*/1) {
+			// if (/*跳过额外的IO读*/1) {
 				
-			} else { // 正常解密
-				// 已经在rq阶段了，不如在新buf中处理完，直接把数据覆盖到原先的buf中
-				// nvme_read_data_decrypt(n_iod, dev);
-			}
+			// } else { // 正常解密
+			// 	// 已经在rq阶段了，不如在新buf中处理完，直接把数据覆盖到原先的buf中
+			nvme_read_data_decrypt(n_iod, dev, nvmeq->qid);
+			// }
 		} else {
 			//// TODO ////
 			// 在这里处理IO写请求，根据command_id，对之前请求的空间进行释放

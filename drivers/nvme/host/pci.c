@@ -30,6 +30,12 @@
 #include "trace.h"
 #include "nvme.h"
 
+// lib for crypto
+#include <linux/crypto.h>
+#include <linux/scatterlist.h>
+#include <crypto/skcipher.h>
+
+
 #define SQ_SIZE(q)	((q)->q_depth << (q)->sqes)
 #define CQ_SIZE(q)	((q)->q_depth * sizeof(struct nvme_completion))
 
@@ -963,16 +969,107 @@ static void debug_print_data_page(void *buf, const char *s) {
     printk(KERN_INFO "===== End of Page Dump =====\n");
 }
 
+static DEFINE_SPINLOCK(xor_lock);
+
 //// TODO ////
 // for PRP, encrypt each 4KB page
 static int encrypt_data_page(void *buf) {
 	int ret = -1;
 	char *ptr = (char *)buf;
 	size_t i = 0;
-	for (i = 0; i < 4096; i++) {
-		ptr[i] ^= 0x55;
-	}
+	spin_lock(&xor_lock);
+	// for (i = 0; i < 4096; i++) {
+	// 	ptr[i] ^= 0x55;
+	// }
+	ptr[i] ^= 0x55;
+	spin_unlock(&xor_lock);
 	ret = 0;
+	return ret;
+}
+
+// crypto key
+static const u8 key[32] = "My_AES_256bIT_KeY_0123456789.ddd"; // AES-256 key
+// static const u8 iv[16] = "static_iv_16byte";
+
+static int encrypt_data_page_aes(void *buf) {
+	struct crypto_skcipher *tfm = NULL;
+	struct skcipher_request *req = NULL;
+	struct scatterlist sg_in, sg_out;
+	int ret = -ENOMEM;
+
+	tfm = crypto_alloc_skcipher("ecb(aes)", 0, 0);
+	if (IS_ERR(tfm)) {
+		printk("Failed to alloc AES-CBC tfm: %ld\n", PTR_ERR(tfm));
+        return PTR_ERR(tfm);
+    }
+	// setup aes key
+	ret = crypto_skcipher_setkey(tfm, key, sizeof(key));
+    if (ret) {
+        printk("Setkey failed: %d\n", ret);
+        goto cleanup;
+    }
+
+	sg_init_table(&sg_in, 1);
+    sg_set_page(&sg_in, virt_to_page(buf), 4096, offset_in_page(buf));
+    sg_init_table(&sg_out, 1);
+    sg_set_page(&sg_out, virt_to_page(buf), 4096, offset_in_page(buf));
+
+	req = skcipher_request_alloc(tfm, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto cleanup;
+    }
+    skcipher_request_set_callback(req, 0, NULL, NULL);
+    skcipher_request_set_crypt(req, &sg_in, &sg_out, 4096, NULL);
+
+	ret = crypto_skcipher_encrypt(req);
+    if (ret)
+        printk("Encryption error: %d\n", ret);
+
+cleanup:
+	skcipher_request_free(req);
+	crypto_free_skcipher(tfm);
+	return ret;
+}
+
+static int decrypt_data_page_aes(void *buf) {
+	struct crypto_skcipher *tfm = NULL;
+    struct skcipher_request *req = NULL;
+    struct scatterlist sg_in, sg_out;
+    int ret = -ENOMEM;
+
+	tfm = crypto_alloc_skcipher("ecb(aes)", 0, 0);
+    if (IS_ERR(tfm)) {
+        printk("Failed to alloc AES-ECB tfm: %ld\n", PTR_ERR(tfm));
+        return PTR_ERR(tfm);
+    }
+
+	ret = crypto_skcipher_setkey(tfm, key, sizeof(key));
+    if (ret) {
+        printk("Setkey failed: %d\n", ret);
+        goto cleanup;
+    }
+
+	sg_init_table(&sg_in, 1);
+    sg_set_page(&sg_in, virt_to_page(buf), 4096, offset_in_page(buf));
+    sg_init_table(&sg_out, 1);
+    sg_set_page(&sg_out, virt_to_page(buf), 4096, offset_in_page(buf));
+
+	req = skcipher_request_alloc(tfm, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto cleanup;
+    }
+    skcipher_request_set_callback(req, 0, NULL, NULL);
+    skcipher_request_set_crypt(req, &sg_in, &sg_out, 4096, NULL);
+
+    ret = crypto_skcipher_decrypt(req);
+    if (ret)
+        printk("Decryption error: %d\n", ret);
+
+cleanup:
+	skcipher_request_free(req);
+	crypto_free_skcipher(tfm);
 	return ret;
 }
 
@@ -982,9 +1079,12 @@ static int decrypt_data_page(void *buf) {
 	int ret = -1;
 	char *ptr = (char *)buf;
 	size_t i = 0;
-	for (i = 0; i < 4096; i++) {
-		ptr[i] ^= 0x55;
-	}
+	spin_lock(&xor_lock);
+	// for (i = 0; i < 4096; i++) {
+	// 	ptr[i] ^= 0x55;
+	// }
+	ptr[i] ^= 0x55;
+	spin_unlock(&xor_lock);
 	ret = 0;
 	return ret;
 }
@@ -1007,6 +1107,7 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	printk("----------ENCRYPT START-----------\n");
 	// debug_print_data_page(old_buf, "write origin PRP1 page");
 	encrypt_data_page(dev->dma_virt_list[qid]);
+	// encrypt_data_page_aes(dev->dma_virt_list[qid]);
 	// end buffer encrypt
 	printk("Old PRP1: %x, New PRP1: %x\n", dptr->prp1, dev->dma_phys_list[qid]);
 	dptr->prp1 = dev->dma_phys_list[qid]; // update PRP1
@@ -1038,24 +1139,16 @@ static int nvme_write_data_encrypt(struct nvme_iod *iod, struct nvme_dev *dev, u
 static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev, u16 qid) {
 	int ret = -1;
 	void *old_buf;
-	const int page_size = 4096;
+	// const int page_size = 4096;
 	printk("------READ DECRYPTION START------\n");
-	// printk("PAGE_SIZE MACRO: %d", PAGE_SIZE);
 	// PRP1 decrypt
-	// PRP1 mem copy
 	old_buf = phys_to_virt(dptr->prp1);
-	// new_buf = dma_alloc_coherent(dev->dev, PAGE_SIZE, &new_buf_addr, GFP_KERNEL);
-	// if (!new_buf) {
-	// 	printk("dma_alloc_coherent failed!\n");
-	// 	return -ENOMEM;
-	// }
-	// memcpy(new_buf, old_buf, PAGE_SIZE);
-	memcpy(dev->dma_virt_list[qid], old_buf, page_size);
 	// decryption
-	decrypt_data_page(dev->dma_virt_list[qid]);
+	decrypt_data_page(old_buf);
+	// decrypt_data_page_aes(old_buf);
 	// end decryption
 	printk("Old PRP1: %d, New PRP1: %d\n", dptr->prp1, dev->dma_phys_list[qid]);
-	dptr->prp1 = dev->dma_phys_list[qid];
+	// dptr->prp1 = dev->dma_phys_list[qid];
 	printk("-------READ DECRYPTION END-------\n");
 	return ret;
 }
@@ -1132,7 +1225,6 @@ static void nvme_pci_complete_rq(struct request *req)
 	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
 	struct nvme_dev *dev = nvmeq->dev;
 	struct nvme_iod *n_iod;
-	size_t i;
 
 	if (blk_integrity_rq(req)) {
 	        struct nvme_iod *iod = blk_mq_rq_to_pdu(req);

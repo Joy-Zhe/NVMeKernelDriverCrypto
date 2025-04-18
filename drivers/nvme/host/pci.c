@@ -940,33 +940,37 @@ out_free_cmd:
 
 //// TODO ////
 // debug, crypto page printing
-static void debug_print_data_page(void *buf, const char *s) {
-	const size_t chunk_size = 64; // 每次打印64字节，减少printk调用次数
-    unsigned char *ptr = (unsigned char *)buf;
-    size_t total_printed = 0;
-    
-    // 打印页头信息
-    printk(KERN_INFO "===== 4KB Page Dump at %s =====\n", s);
+#define LINE_BUFFER_SIZE 256
+static void nvme_p2p_print_value(void *data, unsigned bufferlen, const char *name) {
+    unsigned char *bytes;
+    char line_buffer[LINE_BUFFER_SIZE];
+    unsigned i, line_num;
+    int offset;
 
-    // 分块打印以避免日志截断
-    while (total_printed < PAGE_SIZE) {
-        size_t remaining = PAGE_SIZE - total_printed;
-        size_t print_size = min(remaining, chunk_size);
+    if (!data || bufferlen == 0) {
+        pr_info("No data to print.\n");
+        return;
+    }
+	offset = 0;
+	line_num = 0;
+	bytes = (unsigned char *)data;
 
-        // 使用内核内置的十六进制打印函数
-        print_hex_dump(KERN_INFO, "", DUMP_PREFIX_OFFSET,
-                       16, 1, // 每行16字节，1字节对齐
-                       ptr + total_printed,
-                       print_size, 
-                       true); // ASCII显示
+	pr_info("bufferlen is %d %d\n", bufferlen, bufferlen % 16);
+    pr_info("char %s[] = {\n", name);
 
-        total_printed += print_size;
+    for (i = 0; i < bufferlen; i++) {
+        offset += snprintf(line_buffer + offset, LINE_BUFFER_SIZE - offset, "0x%02x, ", bytes[i]);
 
-        // 防止CPU被长时间占用
-        cond_resched();
+        if (offset >= LINE_BUFFER_SIZE - 10 || (i + 1) % 16 == 0 || i == bufferlen - 1) {
+            strncat(line_buffer, "\n", LINE_BUFFER_SIZE - offset - 1);
+            pr_info("Line %d: [%s] %s", line_num, name, line_buffer);
+            offset = 0;
+            line_buffer[0] = '\0';
+			line_num++;
+        }
     }
 
-    printk(KERN_INFO "===== End of Page Dump =====\n");
+    pr_info("};\n");
 }
 
 static DEFINE_SPINLOCK(xor_lock);
@@ -978,10 +982,9 @@ static int encrypt_data_page(void *buf) {
 	char *ptr = (char *)buf;
 	size_t i = 0;
 	spin_lock(&xor_lock);
-	// for (i = 0; i < 4096; i++) {
-	// 	ptr[i] ^= 0x55;
-	// }
-	ptr[i] ^= 0x55;
+	for (i = 0; i < 4096; i++) {
+		ptr[i] ^= 0x55;
+	}
 	spin_unlock(&xor_lock);
 	ret = 0;
 	return ret;
@@ -991,15 +994,15 @@ static int encrypt_data_page(void *buf) {
 static const u8 key[32] = "My_AES_256bIT_KeY_0123456789.ddd"; // AES-256 key
 // static const u8 iv[16] = "static_iv_16byte";
 
-static int encrypt_data_page_aes(void *buf) {
+static int data_page_aes(void *buf, bool is_encrypt) { // is_encrypt = true for encrypt, false for decrypt
 	struct crypto_skcipher *tfm = NULL;
 	struct skcipher_request *req = NULL;
-	struct scatterlist sg_in, sg_out;
+	struct scatterlist sg;
 	int ret = -ENOMEM;
 
 	tfm = crypto_alloc_skcipher("ecb(aes)", 0, 0);
 	if (IS_ERR(tfm)) {
-		printk("Failed to alloc AES-CBC tfm: %ld\n", PTR_ERR(tfm));
+		printk("Failed to alloc AES-ECB tfm: %ld\n", PTR_ERR(tfm));
         return PTR_ERR(tfm);
     }
 	// setup aes key
@@ -1009,10 +1012,7 @@ static int encrypt_data_page_aes(void *buf) {
         goto cleanup;
     }
 
-	sg_init_table(&sg_in, 1);
-    sg_set_page(&sg_in, virt_to_page(buf), 4096, offset_in_page(buf));
-    sg_init_table(&sg_out, 1);
-    sg_set_page(&sg_out, virt_to_page(buf), 4096, offset_in_page(buf));
+	sg_init_one(&sg, buf, 4096);
 
 	req = skcipher_request_alloc(tfm, GFP_KERNEL);
     if (!req) {
@@ -1020,52 +1020,17 @@ static int encrypt_data_page_aes(void *buf) {
         goto cleanup;
     }
     skcipher_request_set_callback(req, 0, NULL, NULL);
-    skcipher_request_set_crypt(req, &sg_in, &sg_out, 4096, NULL);
+    skcipher_request_set_crypt(req, &sg, &sg, 4096, NULL);
 
-	ret = crypto_skcipher_encrypt(req);
-    if (ret)
+	if (is_encrypt) {
+		ret = crypto_skcipher_encrypt(req);
+	} else {
+		ret = crypto_skcipher_decrypt(req);
+	}
+    if (ret && is_encrypt)
         printk("Encryption error: %d\n", ret);
-
-cleanup:
-	skcipher_request_free(req);
-	crypto_free_skcipher(tfm);
-	return ret;
-}
-
-static int decrypt_data_page_aes(void *buf) {
-	struct crypto_skcipher *tfm = NULL;
-    struct skcipher_request *req = NULL;
-    struct scatterlist sg_in, sg_out;
-    int ret = -ENOMEM;
-
-	tfm = crypto_alloc_skcipher("ecb(aes)", 0, 0);
-    if (IS_ERR(tfm)) {
-        printk("Failed to alloc AES-ECB tfm: %ld\n", PTR_ERR(tfm));
-        return PTR_ERR(tfm);
-    }
-
-	ret = crypto_skcipher_setkey(tfm, key, sizeof(key));
-    if (ret) {
-        printk("Setkey failed: %d\n", ret);
-        goto cleanup;
-    }
-
-	sg_init_table(&sg_in, 1);
-    sg_set_page(&sg_in, virt_to_page(buf), 4096, offset_in_page(buf));
-    sg_init_table(&sg_out, 1);
-    sg_set_page(&sg_out, virt_to_page(buf), 4096, offset_in_page(buf));
-
-	req = skcipher_request_alloc(tfm, GFP_KERNEL);
-    if (!req) {
-        ret = -ENOMEM;
-        goto cleanup;
-    }
-    skcipher_request_set_callback(req, 0, NULL, NULL);
-    skcipher_request_set_crypt(req, &sg_in, &sg_out, 4096, NULL);
-
-    ret = crypto_skcipher_decrypt(req);
-    if (ret)
-        printk("Decryption error: %d\n", ret);
+	else if (ret && !is_encrypt)
+		printk("Decryption error: %d\n", ret);
 
 cleanup:
 	skcipher_request_free(req);
@@ -1080,10 +1045,9 @@ static int decrypt_data_page(void *buf) {
 	char *ptr = (char *)buf;
 	size_t i = 0;
 	spin_lock(&xor_lock);
-	// for (i = 0; i < 4096; i++) {
-	// 	ptr[i] ^= 0x55;
-	// }
-	ptr[i] ^= 0x55;
+	for (i = 0; i < 4096; i++) {
+		ptr[i] ^= 0x55;
+	}
 	spin_unlock(&xor_lock);
 	ret = 0;
 	return ret;
@@ -1105,11 +1069,12 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	}
 	// new buffer encrypt
 	printk("----------ENCRYPT START-----------\n");
-	// debug_print_data_page(old_buf, "write origin PRP1 page");
-	encrypt_data_page(dev->dma_virt_list[qid]);
-	// encrypt_data_page_aes(dev->dma_virt_list[qid]);
+	nvme_p2p_print_value(dev->dma_virt_list[qid], 4096, "before encrypto");
+	// encrypt_data_page(dev->dma_virt_list[qid]);
+	data_page_aes(dev->dma_virt_list[qid], true);
+	nvme_p2p_print_value(dev->dma_virt_list[qid], 4096, "after encrypto");
 	// end buffer encrypt
-	printk("Old PRP1: %x, New PRP1: %x\n", dptr->prp1, dev->dma_phys_list[qid]);
+	// printk("Old PRP1: %x, New PRP1: %x\n", dptr->prp1, dev->dma_phys_list[qid]);
 	dptr->prp1 = dev->dma_phys_list[qid]; // update PRP1
 	printk("-----------ENCRYPT END------------\n");
 	ret = 0;
@@ -1144,10 +1109,12 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	// PRP1 decrypt
 	old_buf = phys_to_virt(dptr->prp1);
 	// decryption
-	decrypt_data_page(old_buf);
-	// decrypt_data_page_aes(old_buf);
+	nvme_p2p_print_value(old_buf, 4096, "before decrypto");
+	// decrypt_data_page(old_buf);
+	data_page_aes(old_buf, false);
+	nvme_p2p_print_value(old_buf, 4096, "after decrypto");
 	// end decryption
-	printk("Old PRP1: %d, New PRP1: %d\n", dptr->prp1, dev->dma_phys_list[qid]);
+	// printk("Old PRP1: %d, New PRP1: %d\n", dptr->prp1, dev->dma_phys_list[qid]);
 	// dptr->prp1 = dev->dma_phys_list[qid];
 	printk("-------READ DECRYPTION END-------\n");
 	return ret;
@@ -1208,9 +1175,9 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 			nvme_write_data_encrypt(iod, dev, nvmeq->qid);
 			printk("====Write Data ENCRYPT====\n");
 		} 
-		// else if (iod->cmd.rw.opcode == nvme_cmd_read) { // read command, decrypt
-		// 	nvme_read_data_decrypt(iod);
-		// }
+		else if (iod->cmd.rw.opcode == nvme_cmd_read) { // read command, decrypt
+			// printk("nvme_read_cmnd_nlb: %d\n", iod->cmd.rw.length);
+		}
 	}
 	// end additional logic
 

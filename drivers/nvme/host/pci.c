@@ -37,7 +37,8 @@
 #define FPGA_BAR0_BASE 0xA0000000
 #define FPGA_BRAM0_ST (FPGA_BAR0_BASE + 0x80000)
 
-
+// #define FPGA
+#define SOFTWARE
 
 #define SQ_SIZE(q)	((q)->q_depth << (q)->sqes)
 #define CQ_SIZE(q)	((q)->q_depth * sizeof(struct nvme_completion))
@@ -92,8 +93,10 @@ static int io_queue_count_set(const char *val, const struct kernel_param *kp)
 	ret = kstrtouint(val, 10, &n);
 	if (ret != 0 || n > num_possible_cpus())
 		return -EINVAL;
-	// return param_set_uint(val, kp);
+#ifdef FPGA
 	return param_set_uint("4", kp); // fix 4 queue
+#endif
+	return param_set_uint(val, kp);
 }
 
 static const struct kernel_param_ops io_queue_count_ops = {
@@ -989,11 +992,11 @@ static int encrypt_data_page(void *buf) {
 	int ret = -1;
 	char *ptr = (char *)buf;
 	size_t i = 0;
-	spin_lock(&xor_lock);
+	// spin_lock(&xor_lock);
 	for (i = 0; i < 4096; i++) {
 		ptr[i] ^= 0x55;
 	}
-	spin_unlock(&xor_lock);
+	// spin_unlock(&xor_lock);
 	ret = 0;
 	return ret;
 }
@@ -1056,11 +1059,11 @@ static int decrypt_data_page(void *buf) {
 	int ret = -1;
 	char *ptr = (char *)buf;
 	size_t i = 0;
-	spin_lock(&xor_lock);
+	// spin_lock(&xor_lock);
 	for (i = 0; i < 4096; i++) {
 		ptr[i] ^= 0x55;
 	}
-	spin_unlock(&xor_lock);
+	// spin_unlock(&xor_lock);
 	ret = 0;
 	return ret;
 }
@@ -1088,34 +1091,38 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	// PRP1 mem copy
 	void *old_buf = phys_to_virt(dptr->prp1);
 	if (dev->dma_virt_list[qid - 1]) { // 实际上list里的index 0才对应了qid 1，所以得-1
-		// memcpy(dev->dma_virt_list[qid], old_buf, page_size);
-
+#ifdef SOFTWARE
+		memcpy(dev->dma_virt_list[qid - 1], old_buf, page_size);
+		// new buffer encrypt
+		// printk("----------ENCRYPT START-----------\n");
+		// nvme_p2p_print_value(dev->dma_virt_list[qid], 4096, "before encrypto");
+		encrypt_data_page(dev->dma_virt_list[qid]);
+		// data_page_aes(dev->dma_virt_list[qid], true);
+		// nvme_p2p_print_value(dev->dma_virt_list[qid], 4096, "after encrypto");
+		// end buffer encrypt
+		// printk("Old PRP1: %x, New PRP1: %x\n", dptr->prp1, dev->dma_phys_list[qid]);
+#endif
+#ifdef FPGA
 		// FPGA encrypt
 		memcpy_toio(dev->dma_virt_list[qid - 1], old_buf, page_size);
 		// read first
 		config1 = readl(dev->config_1_reg);
 		// triger posedge 
 		mask = ~(1 << (qid - 1));
-		printk("mask: %x\n", mask);
+		// printk("mask: %x\n", mask);
 		writel(config1 & mask, dev->config_1_reg);
 		mask = ~mask; 
-		printk("mask: %x\n", mask);
+		// printk("mask: %x\n", mask);
 		writel(config1 | mask, dev->config_1_reg);
 		// FPGA encrypt end
+#endif
 	}
 	else {
 		return -ENOMEM;
 	}
-	// new buffer encrypt
-	// printk("----------ENCRYPT START-----------\n");
-	// nvme_p2p_print_value(dev->dma_virt_list[qid], 4096, "before encrypto");
-	// encrypt_data_page(dev->dma_virt_list[qid]);
-	// data_page_aes(dev->dma_virt_list[qid], true);
-	// nvme_p2p_print_value(dev->dma_virt_list[qid], 4096, "after encrypto");
-	// end buffer encrypt
-	// printk("Old PRP1: %x, New PRP1: %x\n", dptr->prp1, dev->dma_phys_list[qid]);
+
 	dptr->prp1 = dev->dma_phys_list[qid - 1]; // update PRP1
-	printk("QID: %d, PRP1: %x\n", qid, dptr->prp1);
+	// printk("QID: %d, PRP1: %x\n", qid, dptr->prp1);
 	// printk("-----------ENCRYPT END------------\n");
 	ret = 0;
 
@@ -1150,7 +1157,8 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	// printk("------READ DECRYPTION START------\n");
 	// PRP1 decrypt
 	old_buf = phys_to_virt(dptr->prp1);
-	// decryption
+#ifdef SOFTWARE
+	// decryption start
 	// nvme_p2p_print_value(old_buf, 4096, "before decrypto");
 	// if (crypto_work) {
 	// 	INIT_WORK(&crypto_work->work, nvme_crypto_work_handle);
@@ -1158,27 +1166,27 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	// 	crypto_work->is_encrypt = false;
 	// 	schedule_work(&crypto_work->work);
 	// }
-	// decrypt_data_page(old_buf);
+	decrypt_data_page(old_buf);
 	// data_page_aes(old_buf, false);
 	// end decryption
 	// printk("Old PRP1: %d, New PRP1: %d\n", dptr->prp1, dev->dma_phys_list[qid]);
-	// dptr->prp1 = dev->dma_phys_list[qid];
 	// printk("-------READ DECRYPTION END-------\n");
-	
+#endif
+#ifdef FPGA
 	// FPGA decrypt
 	memcpy_toio(dev->dma_virt_list[qid - 1], old_buf, 4096);
 	// read first
 	config1 = readl(dev->config_1_reg);
 	mask = ~(1 << (qid - 1));
-	printk("mask: %x\n", mask);
+	// printk("mask: %x\n", mask);
 	// triger posedge 
 	writel(config1 & mask, dev->config_1_reg);
 	mask = ~mask;
-	printk("mask: %x\n", mask);
+	// printk("mask: %x\n", mask);
 	writel(config1 | mask, dev->config_1_reg);
 	memcpy_fromio(old_buf, dev->dma_virt_list[qid - 1], 4096);
-	
 	// nvme_p2p_print_value(old_buf, 4096, "after decrypto");
+#endif
 	return ret;
 }
 
@@ -2595,8 +2603,10 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	dev->nr_write_queues = write_queues;
 	dev->nr_poll_queues = poll_queues;
 
-	// nr_io_queues = dev->nr_allocated_queues - 1;
+	nr_io_queues = dev->nr_allocated_queues - 1;
+#ifdef FPGA	
 	nr_io_queues = 4; // fix to 4, for fpga test
+#endif
 	result = nvme_set_queue_count(&dev->ctrl, &nr_io_queues);
 	if (result < 0)
 		return result;
@@ -3418,30 +3428,31 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	nvme_reset_ctrl(&dev->ctrl);
 	async_schedule(nvme_async_probe, dev);
 
-	// //// TODO ////
-	// // allocate global buffer for each queue ectrypt
-	// dev->dma_virt_list = kcalloc(block_nums, sizeof(void*), GFP_KERNEL);
-	// if (!dev->dma_virt_list) {
-	// 	// printk("DMA VIRT alloc failed.\n");
-	// 	return -ENOMEM;
-	// }
-	// dev->dma_phys_list = kcalloc(block_nums, sizeof(dma_addr_t), GFP_KERNEL);
-	// if (!dev->dma_phys_list) {
-	// 	// printk("DMA PHYS alloc failed.\n");
-	// 	return -ENOMEM;
-	// }
-	// for (i = 0; i < block_nums; i++) {
-	// 	dev->dma_virt_list[i] = dma_alloc_coherent(dev->dev, block_size, &dev->dma_phys_list[i], GFP_KERNEL);
-	// 	if (!dev->dma_virt_list[i]) {
-	// 		// printk("DMA VIRT [%d] alloc failed.\n", i);
-	// 		return -ENOMEM;
-	// 	}
-	// }
-	// dev->dma_allocated = block_nums;
-	
+	//// TODO ////
+#ifdef SOFTWARE
+	// allocate global buffer for each queue ectrypt
+	dev->dma_virt_list = kcalloc(block_nums, sizeof(void*), GFP_KERNEL);
+	if (!dev->dma_virt_list) {
+		// printk("DMA VIRT alloc failed.\n");
+		return -ENOMEM;
+	}
+	dev->dma_phys_list = kcalloc(block_nums, sizeof(dma_addr_t), GFP_KERNEL);
+	if (!dev->dma_phys_list) {
+		// printk("DMA PHYS alloc failed.\n");
+		return -ENOMEM;
+	}
+	for (i = 0; i < block_nums; i++) {
+		dev->dma_virt_list[i] = dma_alloc_coherent(dev->dev, block_size, &dev->dma_phys_list[i], GFP_KERNEL);
+		if (!dev->dma_virt_list[i]) {
+			// printk("DMA VIRT [%d] alloc failed.\n", i);
+			return -ENOMEM;
+		}
+	}
+	dev->dma_allocated = block_nums;
+#endif
 	////TODO////
 	// FPGA BRAM
-
+#ifdef FPGA
 	block_nums = 4;
 	void __iomem *fixed_virt_base = ioremap(FPGA_BRAM0_ST, block_nums * 0x1000);
 	if (!fixed_virt_base) {
@@ -3501,7 +3512,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	// 		}
 	// 	}
 	// }
-
+#endif
 	return 0;
 
 out_release_prp_pools:
@@ -3571,18 +3582,21 @@ static void nvme_remove(struct pci_dev *pdev)
 
 	//// TODO ////
 	// free global buffer
-	// if (dev->dma_phys_list && dev->dma_virt_list) {
-	// 	for (i = 0; i < dev->dma_allocated; i++) {
-	// 		if (dev->dma_virt_list[i]) {
-	// 			dma_free_coherent(dev->dev, block_size, dev->dma_virt_list[i], dev->dma_phys_list[i]);
-	// 			dev->dma_virt_list[i] = NULL;
-	// 		}
-	// 	}	
-	// }
+#ifdef SOFTWARE
+	if (dev->dma_phys_list && dev->dma_virt_list) {
+		for (i = 0; i < dev->dma_allocated; i++) {
+			if (dev->dma_virt_list[i]) {
+				dma_free_coherent(dev->dev, block_size, dev->dma_virt_list[i], dev->dma_phys_list[i]);
+				dev->dma_virt_list[i] = NULL;
+			}
+		}	
+	}
 
-	// kfree(dev->dma_phys_list);
-	// kfree(dev->dma_virt_list);
+	kfree(dev->dma_phys_list);
+	kfree(dev->dma_virt_list);
+#endif
 	// FPGA free
+#ifdef FPGA
 	if (dev->dma_phys_list && dev->dma_virt_list) {
 		for (i = 0; i < dev->dma_allocated; i++) {
 			if (dev->dma_virt_list[i]) {
@@ -3595,7 +3609,7 @@ static void nvme_remove(struct pci_dev *pdev)
 	kfree(dev->dma_phys_list);
 	kfree(dev->dma_virt_list);
 	// free done
-
+#endif
 	flush_work(&dev->ctrl.reset_work);
 	nvme_stop_ctrl(&dev->ctrl);
 	nvme_remove_namespaces(&dev->ctrl);

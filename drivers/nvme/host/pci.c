@@ -1083,6 +1083,7 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	int ret = -1;
 	const int page_size = 4096;
 	uint32_t config1;
+	uint32_t mask = 0xFFFF;
 	// PRP1 encrypt
 	// PRP1 mem copy
 	void *old_buf = phys_to_virt(dptr->prp1);
@@ -1094,8 +1095,12 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 		// read first
 		config1 = readl(dev->config_1_reg);
 		// triger posedge 
-		writel(config1 & 0xFFFE, dev->config_1_reg);
-		writel(config1 | 0x0001, dev->config_1_reg);
+		mask = ~(1 << (qid - 1));
+		printk("mask: %x\n", mask);
+		writel(config1 & mask, dev->config_1_reg);
+		mask = ~mask; 
+		printk("mask: %x\n", mask);
+		writel(config1 | mask, dev->config_1_reg);
 		// FPGA encrypt end
 	}
 	else {
@@ -1139,7 +1144,7 @@ static int nvme_write_data_encrypt(struct nvme_iod *iod, struct nvme_dev *dev, u
 static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev, u16 qid) {
 	int ret = -1;
 	void *old_buf;
-	uint32_t config1;
+	uint32_t config1, mask;
 	// struct nvme_crypto_work *crypto_work = kmalloc(sizeof(*crypto_work), GFP_ATOMIC);
 	// const int page_size = 4096;
 	// printk("------READ DECRYPTION START------\n");
@@ -1155,20 +1160,25 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	// }
 	// decrypt_data_page(old_buf);
 	// data_page_aes(old_buf, false);
-	// nvme_p2p_print_value(old_buf, 4096, "after decrypto");
 	// end decryption
 	// printk("Old PRP1: %d, New PRP1: %d\n", dptr->prp1, dev->dma_phys_list[qid]);
 	// dptr->prp1 = dev->dma_phys_list[qid];
 	// printk("-------READ DECRYPTION END-------\n");
-
+	
 	// FPGA decrypt
 	memcpy_toio(dev->dma_virt_list[qid - 1], old_buf, 4096);
 	// read first
 	config1 = readl(dev->config_1_reg);
+	mask = ~(1 << (qid - 1));
+	printk("mask: %x\n", mask);
 	// triger posedge 
-	writel(config1 & 0xFFFE, dev->config_1_reg);
-	writel(config1 | 0x0001, dev->config_1_reg);
-
+	writel(config1 & mask, dev->config_1_reg);
+	mask = ~mask;
+	printk("mask: %x\n", mask);
+	writel(config1 | mask, dev->config_1_reg);
+	memcpy_fromio(old_buf, dev->dma_virt_list[qid - 1], 4096);
+	
+	// nvme_p2p_print_value(old_buf, 4096, "after decrypto");
 	return ret;
 }
 
@@ -1245,22 +1255,6 @@ static void nvme_pci_complete_rq(struct request *req)
 	struct nvme_dev *dev = nvmeq->dev;
 	struct nvme_iod *n_iod;
 
-	if (blk_integrity_rq(req)) {
-	        struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
-
-		dma_unmap_page(dev->dev, iod->meta_dma,
-			       rq_integrity_vec(req)->bv_len, rq_dma_dir(req));
-	}
-	
-	if (blk_rq_nr_phys_segments(req))
-		nvme_unmap_data(dev, req);
-	nvme_complete_rq(req);
-
-	// if (in_interrupt()) {
-	// 	printk("nvme_pci_in_interrupt!\n");
-	// }
-
-	// NVMe DMA engine processing finished
 	// decrypt data
 	//// TODO ////
 	if (nvmeq->qid > 0) {
@@ -1287,6 +1281,23 @@ static void nvme_pci_complete_rq(struct request *req)
 		}
 		// printk("--------END READ LOGIC-----------\n");
 	}
+
+	if (blk_integrity_rq(req)) {
+	        struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+
+		dma_unmap_page(dev->dev, iod->meta_dma,
+			       rq_integrity_vec(req)->bv_len, rq_dma_dir(req));
+	}
+	
+	if (blk_rq_nr_phys_segments(req))
+		nvme_unmap_data(dev, req);
+	nvme_complete_rq(req);
+
+	// if (in_interrupt()) {
+	// 	printk("nvme_pci_in_interrupt!\n");
+	// }
+
+	// NVMe DMA engine processing finished
 }
 
 /* We read the CQE phase first to check if the rest of the entry is valid */

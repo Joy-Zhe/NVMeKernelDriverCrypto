@@ -37,8 +37,8 @@
 #define FPGA_BAR0_BASE 0xA0000000
 #define FPGA_BRAM0_ST (FPGA_BAR0_BASE + 0x80000)
 
-// #define FPGA
-#define SOFTWARE
+#define FPGA
+// #define SOFTWARE
 
 #define SQ_SIZE(q)	((q)->q_depth << (q)->sqes)
 #define CQ_SIZE(q)	((q)->q_depth * sizeof(struct nvme_completion))
@@ -96,7 +96,9 @@ static int io_queue_count_set(const char *val, const struct kernel_param *kp)
 #ifdef FPGA
 	return param_set_uint("4", kp); // fix 4 queue
 #endif
+#ifdef SOFTWARE
 	return param_set_uint(val, kp);
+#endif
 }
 
 static const struct kernel_param_ops io_queue_count_ops = {
@@ -1082,7 +1084,7 @@ static void nvme_crypto_work_handle(struct work_struct *work) {
 
 //// TODO //// 
 // encrypt PRP traversal
-static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev, u16 qid) {
+static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev, u16 qid, u16 command_id) {
 	int ret = -1;
 	const int page_size = 4096;
 	uint32_t config1;
@@ -1090,13 +1092,13 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	// PRP1 encrypt
 	// PRP1 mem copy
 	void *old_buf = phys_to_virt(dptr->prp1);
-	if (dev->dma_virt_list[qid - 1]) { // 实际上list里的index 0才对应了qid 1，所以得-1
+	if (dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)]) { // 实际上list里的index 0才对应了qid 1，所以得-1
 #ifdef SOFTWARE
-		memcpy(dev->dma_virt_list[qid - 1], old_buf, page_size);
+		memcpy(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)], old_buf, page_size);
 		// new buffer encrypt
 		// printk("----------ENCRYPT START-----------\n");
 		// nvme_p2p_print_value(dev->dma_virt_list[qid], 4096, "before encrypto");
-		encrypt_data_page(dev->dma_virt_list[qid]);
+		encrypt_data_page(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)]);
 		// data_page_aes(dev->dma_virt_list[qid], true);
 		// nvme_p2p_print_value(dev->dma_virt_list[qid], 4096, "after encrypto");
 		// end buffer encrypt
@@ -1104,11 +1106,11 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 #endif
 #ifdef FPGA
 		// FPGA encrypt
-		memcpy_toio(dev->dma_virt_list[qid - 1], old_buf, page_size);
+		memcpy_toio(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)], old_buf, page_size);
 		// read first
 		config1 = readl(dev->config_1_reg);
 		// triger posedge 
-		mask = ~(1 << (qid - 1));
+		mask = ~(1 << ((qid - 1) * 4 + (command_id % 4)));
 		// printk("mask: %x\n", mask);
 		writel(config1 & mask, dev->config_1_reg);
 		mask = ~mask; 
@@ -1121,7 +1123,7 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 		return -ENOMEM;
 	}
 
-	dptr->prp1 = dev->dma_phys_list[qid - 1]; // update PRP1
+	dptr->prp1 = dev->dma_phys_list[(qid - 1) * 4 + (command_id % 4)]; // update PRP1
 	// printk("QID: %d, PRP1: %x\n", qid, dptr->prp1);
 	// printk("-----------ENCRYPT END------------\n");
 	ret = 0;
@@ -1132,7 +1134,7 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 
 //// TODO //// 
 // write data encrypt
-static int nvme_write_data_encrypt(struct nvme_iod *iod, struct nvme_dev *dev, u16 qid) {
+static int nvme_write_data_encrypt(struct nvme_iod *iod, struct nvme_dev *dev, u16 qid, u16 command_id) {
 	// struct nvme_command cmnd = iod->cmd;
 	// struct nvme_request req = iod->req;
 	union nvme_data_ptr *dptr = &iod->cmd.rw.dptr;
@@ -1141,14 +1143,14 @@ static int nvme_write_data_encrypt(struct nvme_iod *iod, struct nvme_dev *dev, u
 		// SGL traversal
 	} else {
 		// PRP traversal
-		encrypt_prp_traversal(dptr, dev, qid);
+		encrypt_prp_traversal(dptr, dev, qid, command_id);
 	}
 	return 0;
 }
 
 //// TODO //// 
 // for read data PRP traversal
-static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev, u16 qid) {
+static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev, u16 qid, u16 command_id) {
 	int ret = -1;
 	void *old_buf;
 	uint32_t config1, mask;
@@ -1167,6 +1169,7 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	// 	schedule_work(&crypto_work->work);
 	// }
 	decrypt_data_page(old_buf);
+	// nvme_p2p_print_value(old_buf, 4096, "after decrypto");
 	// data_page_aes(old_buf, false);
 	// end decryption
 	// printk("Old PRP1: %d, New PRP1: %d\n", dptr->prp1, dev->dma_phys_list[qid]);
@@ -1174,17 +1177,21 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 #endif
 #ifdef FPGA
 	// FPGA decrypt
-	memcpy_toio(dev->dma_virt_list[qid - 1], old_buf, 4096);
-	// read first
-	config1 = readl(dev->config_1_reg);
-	mask = ~(1 << (qid - 1));
-	// printk("mask: %x\n", mask);
-	// triger posedge 
-	writel(config1 & mask, dev->config_1_reg);
-	mask = ~mask;
-	// printk("mask: %x\n", mask);
-	writel(config1 | mask, dev->config_1_reg);
-	memcpy_fromio(old_buf, dev->dma_virt_list[qid - 1], 4096);
+	// printk("index: %d\n", (qid - 1) * 4 + (command_id % 4));
+	if (dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)]) {
+		// printk("index: %d\n", (qid - 1) * 4 + (command_id % 4));
+		memcpy_toio(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)], old_buf, 4096);
+		// read first
+		config1 = readl(dev->config_1_reg);
+		mask = ~(1 << ((qid - 1) * 4 + (command_id % 4)));
+		// printk("mask: %x\n", mask);
+		// triger posedge 
+		writel(config1 & mask, dev->config_1_reg);
+		mask = ~mask;
+		// printk("mask: %x\n", mask);
+		writel(config1 | mask, dev->config_1_reg);
+		memcpy_fromio(old_buf, dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)], 4096);
+	}
 	// nvme_p2p_print_value(old_buf, 4096, "after decrypto");
 #endif
 	return ret;
@@ -1192,7 +1199,7 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 
 //// TODO ////
 // read data decrypt
-static int nvme_read_data_decrypt(struct nvme_iod *iod, struct nvme_dev *dev, u16 qid) {
+static int nvme_read_data_decrypt(struct nvme_iod *iod, struct nvme_dev *dev, u16 qid, u16 command_id) {
 	// struct nvme_command cmnd = iod->cmd;
 	// struct nvme_request req = iod->req;
 	union nvme_data_ptr *dptr = &iod->cmd.rw.dptr;
@@ -1201,7 +1208,7 @@ static int nvme_read_data_decrypt(struct nvme_iod *iod, struct nvme_dev *dev, u1
 		// SGL traversal
 	} else {
 		// PPR traversal
-		decrypt_prp_traversal(dptr, dev, qid);
+		decrypt_prp_traversal(dptr, dev, qid, command_id);
 	}
 
 	return 0;
@@ -1242,7 +1249,7 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (nvmeq->qid > 0) { // nvme I/O command, skip nvme admin command
 		if (iod->cmd.rw.opcode == nvme_cmd_write) { // write command, encrypt
 			// printk("====Write Data ENCRYPT====\n");
-			nvme_write_data_encrypt(iod, dev, nvmeq->qid);
+			nvme_write_data_encrypt(iod, dev, nvmeq->qid, iod->cmd.rw.command_id);
 			// printk("====Write Data ENCRYPT====\n");
 		} 
 		else if (iod->cmd.rw.opcode == nvme_cmd_read) { // read command, decrypt
@@ -1277,7 +1284,7 @@ static void nvme_pci_complete_rq(struct request *req)
 				
 			// } else { // 正常解密
 			// 	// 已经在rq阶段了，不如在新buf中处理完，直接把数据覆盖到原先的buf中
-			nvme_read_data_decrypt(n_iod, dev, nvmeq->qid);
+			nvme_read_data_decrypt(n_iod, dev, nvmeq->qid, n_iod->cmd.rw.command_id);
 			// }
 		} else {
 			//// TODO ////
@@ -3403,6 +3410,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	//// TODO ////
 	// params
 	int block_nums = 96; // max 96 cpu cores, max 96 queues
+	int qd = 4;
 	int block_size = 4096;
 	size_t i = 0;
 
@@ -3431,36 +3439,36 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	//// TODO ////
 #ifdef SOFTWARE
 	// allocate global buffer for each queue ectrypt
-	dev->dma_virt_list = kcalloc(block_nums, sizeof(void*), GFP_KERNEL);
+	dev->dma_virt_list = kcalloc(block_nums * qd, sizeof(void*), GFP_KERNEL);
 	if (!dev->dma_virt_list) {
 		// printk("DMA VIRT alloc failed.\n");
 		return -ENOMEM;
 	}
-	dev->dma_phys_list = kcalloc(block_nums, sizeof(dma_addr_t), GFP_KERNEL);
+	dev->dma_phys_list = kcalloc(block_nums * qd, sizeof(dma_addr_t), GFP_KERNEL);
 	if (!dev->dma_phys_list) {
 		// printk("DMA PHYS alloc failed.\n");
 		return -ENOMEM;
 	}
-	for (i = 0; i < block_nums; i++) {
+	for (i = 0; i < block_nums * qd; i++) {
 		dev->dma_virt_list[i] = dma_alloc_coherent(dev->dev, block_size, &dev->dma_phys_list[i], GFP_KERNEL);
 		if (!dev->dma_virt_list[i]) {
 			// printk("DMA VIRT [%d] alloc failed.\n", i);
 			return -ENOMEM;
 		}
 	}
-	dev->dma_allocated = block_nums;
+	dev->dma_allocated = block_nums * qd;
 #endif
 	////TODO////
 	// FPGA BRAM
 #ifdef FPGA
 	block_nums = 4;
-	void __iomem *fixed_virt_base = ioremap(FPGA_BRAM0_ST, block_nums * 0x1000);
+	void __iomem *fixed_virt_base = ioremap(FPGA_BRAM0_ST, block_nums * qd * 0x1000);
 	if (!fixed_virt_base) {
 		printk("FPGA BRAM to VIRT failed!\n");
 		return -ENOMEM;
 	}
 
-	// control regs, config_1[3-0] -> {start4, start3, start2, start1}
+	// control regs, config_1[15-0] -> {start16, ..., start4, start3, start2, start1}
 	void __iomem *config1_regs = ioremap(FPGA_BAR0_BASE, block_size);
 	if (!config1_regs) {
 		printk("FPGA config1 regs to VIRT failed!\n");
@@ -3470,14 +3478,13 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	// dev->config_1_reg = kcalloc(1, sizeof(void *), GFP_KERNEL);
 	dev->config_1_reg = config1_regs;
 
-	dev->dma_virt_list = kcalloc(block_nums, sizeof(void *), GFP_KERNEL);
-	dev->dma_phys_list = kcalloc(block_nums, sizeof(dma_addr_t), GFP_KERNEL);
-	for (i = 0; i < block_nums; i++) {
+	dev->dma_virt_list = kcalloc(block_nums * qd, sizeof(void *), GFP_KERNEL);
+	dev->dma_phys_list = kcalloc(block_nums * qd, sizeof(dma_addr_t), GFP_KERNEL);
+	for (i = 0; i < block_nums * qd; i++) {
 		dev->dma_phys_list[i] = FPGA_BRAM0_ST + i * block_size; // phys addr
 		dev->dma_virt_list[i] = fixed_virt_base + i * block_size;
 	}
-	dev->dma_allocated = block_nums;
-	// dev->max_qid = 4;
+	dev->dma_allocated = block_nums * qd;
 
 	// for debug. memcpy test
 	// u8 *test_data = kzalloc(block_size, GFP_KERNEL);

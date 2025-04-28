@@ -37,8 +37,8 @@
 #define FPGA_BAR0_BASE 0xA0000000
 #define FPGA_BRAM0_ST (FPGA_BAR0_BASE + 0x80000)
 
-#define FPGA
-// #define SOFTWARE
+// #define FPGA
+#define SOFTWARE
 
 #define SQ_SIZE(q)	((q)->q_depth << (q)->sqes)
 #define CQ_SIZE(q)	((q)->q_depth * sizeof(struct nvme_completion))
@@ -79,6 +79,7 @@ static const struct kernel_param_ops io_queue_depth_ops = {
 };
 
 static unsigned int io_queue_depth = 1024;
+// static unsigned int io_queue_depth = 4; // TODO: fix qd to 4
 module_param_cb(io_queue_depth, &io_queue_depth_ops, &io_queue_depth, 0644);
 MODULE_PARM_DESC(io_queue_depth, "set io queue depth, should >= 2 and < 4096");
 
@@ -97,7 +98,7 @@ static int io_queue_count_set(const char *val, const struct kernel_param *kp)
 	return param_set_uint("4", kp); // fix 4 queue
 #endif
 #ifdef SOFTWARE
-	return param_set_uint(val, kp);
+	return param_set_uint("4", kp);
 #endif
 }
 
@@ -952,6 +953,320 @@ out_free_cmd:
 }
 
 //// TODO ////
+// AES-128 PURE SOFTWARE
+typedef uint8_t state_t[4][4];
+static const uint8_t key[16] = {0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c};
+
+static const uint8_t S_BOX[256] = {
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5,
+    0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76, // 0x00-0x0F
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
+    0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0, // 0x10-0x1F
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc,
+    0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15, // 0x20-0x2F
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a,
+    0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75, // 0x30-0x3F
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0,
+    0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84, // 0x40-0x4F
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b,
+    0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf, // 0x50-0x5F
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85,
+    0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8, // 0x60-0x6F
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5,
+    0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2, // 0x70-0x7F
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17,
+    0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73, // 0x80-0x8F
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88,
+    0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb, // 0x90-0x9F
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c,
+    0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79, // 0xA0-0xAF
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9,
+    0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08, // 0xB0-0xBF
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6,
+    0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a, // 0xC0-0xCF
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e,
+    0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e, // 0xD0-0xDF
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94,
+    0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf, // 0xE0-0xEF
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68,
+    0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16 // 0xF0-0xFF
+};
+
+static const uint8_t INV_S_BOX[256] = {
+    0x52, 0x09, 0x6A, 0xD5, 0x30, 0x36, 0xA5, 0x38,
+    0xBF, 0x40, 0xA3, 0x9E, 0x81, 0xF3, 0xD7, 0xFB, // 0x00-0x0F
+    0x7C, 0xE3, 0x39, 0x82, 0x9B, 0x2F, 0xFF, 0x87,
+    0x34, 0x8E, 0x43, 0x44, 0xC4, 0xDE, 0xE9, 0xCB, // 0x10-0x1F
+    0x54, 0x7B, 0x94, 0x32, 0xA6, 0xC2, 0x23, 0x3D,
+    0xEE, 0x4C, 0x95, 0x0B, 0x42, 0xFA, 0xC3, 0x4E, // 0x20-0x2F
+    0x08, 0x2E, 0xA1, 0x66, 0x28, 0xD9, 0x24, 0xB2,
+    0x76, 0x5B, 0xA2, 0x49, 0x6D, 0x8B, 0xD1, 0x25, // 0x30-0x3F
+    0x72, 0xF8, 0xF6, 0x64, 0x86, 0x68, 0x98, 0x16,
+    0xD4, 0xA4, 0x5C, 0xCC, 0x5D, 0x65, 0xB6, 0x92, // 0x40-0x4F
+    0x6C, 0x70, 0x48, 0x50, 0xFD, 0xED, 0xB9, 0xDA,
+    0x5E, 0x15, 0x46, 0x57, 0xA7, 0x8D, 0x9D, 0x84, // 0x50-0x5F
+    0x90, 0xD8, 0xAB, 0x00, 0x8C, 0xBC, 0xD3, 0x0A,
+    0xF7, 0xE4, 0x58, 0x05, 0xB8, 0xB3, 0x45, 0x06, // 0x60-0x6F
+    0xD0, 0x2C, 0x1E, 0x8F, 0xCA, 0x3F, 0x0F, 0x02,
+    0xC1, 0xAF, 0xBD, 0x03, 0x01, 0x13, 0x8A, 0x6B, // 0x70-0x7F
+    0x3A, 0x91, 0x11, 0x41, 0x4F, 0x67, 0xDC, 0xEA,
+    0x97, 0xF2, 0xCF, 0xCE, 0xF0, 0xB4, 0xE6, 0x73, // 0x80-0x8F
+    0x96, 0xAC, 0x74, 0x22, 0xE7, 0xAD, 0x35, 0x85,
+    0xE2, 0xF9, 0x37, 0xE8, 0x1C, 0x75, 0xDF, 0x6E, // 0x90-0x9F
+    0x47, 0xF1, 0x1A, 0x71, 0x1D, 0x29, 0xC5, 0x89,
+    0x6F, 0xB7, 0x62, 0x0E, 0xAA, 0x18, 0xBE, 0x1B, // 0xA0-0xAF
+    0xFC, 0x56, 0x3E, 0x4B, 0xC6, 0xD2, 0x79, 0x20,
+    0x9A, 0xDB, 0xC0, 0xFE, 0x78, 0xCD, 0x5A, 0xF4, // 0xB0-0xBF
+    0x1F, 0xDD, 0xA8, 0x33, 0x88, 0x07, 0xC7, 0x31,
+    0xB1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xEC, 0x5F, // 0xC0-0xCF
+    0x60, 0x51, 0x7F, 0xA9, 0x19, 0xB5, 0x4A, 0x0D,
+    0x2D, 0xE5, 0x7A, 0x9F, 0x93, 0xC9, 0x9C, 0xEF, // 0xD0-0xDF
+    0xA0, 0xE0, 0x3B, 0x4D, 0xAE, 0x2A, 0xF5, 0xB0,
+    0xC8, 0xEB, 0xBB, 0x3C, 0x83, 0x53, 0x99, 0x61, // 0xE0-0xEF
+    0x17, 0x2B, 0x04, 0x7E, 0xBA, 0x77, 0xD6, 0x26,
+    0xE1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0C, 0x7D // 0xF0-0xFF
+};
+
+static const uint8_t MIX_MATRIX[4][4] = {{0x02, 0x03, 0x01, 0x01},
+                                         {0x01, 0x02, 0x03, 0x01},
+                                         {0x01, 0x01, 0x02, 0x03},
+                                         {0x03, 0x01, 0x01, 0x02}};
+
+static const uint8_t INV_MIX_MATRIX[4][4] = {{0x0e, 0x0b, 0x0d, 0x09},
+                                             {0x09, 0x0e, 0x0b, 0x0d},
+                                             {0x0d, 0x09, 0x0e, 0x0b},
+                                             {0x0b, 0x0d, 0x09, 0x0e}};
+
+static const uint8_t RCON[10] = {0x01, 0x02, 0x04, 0x08, 0x10,
+                                 0x20, 0x40, 0x80, 0x1b, 0x36};
+
+void KeyExpansion(const uint8_t *key, uint32_t *w) {
+  uint32_t temp;
+  int i = 0;
+  for (i = 0; i < 4; i++) {
+    w[i] = ((key[4 * i] << 24) | (key[4 * i + 1] << 16) |
+            (key[4 * i + 2] << 8) | key[4 * i + 3]);
+  }
+
+  for (i = 4; i < 44; i++) {
+    temp = w[i - 1];
+    if (i % 4 == 0) {
+      temp = (temp << 8) | (temp >> 24);
+      temp = (S_BOX[(temp >> 24) & 0xFF] << 24) |
+             (S_BOX[(temp >> 16) & 0xFF] << 16) |
+             (S_BOX[(temp >> 8) & 0xFF] << 8) | S_BOX[temp & 0xFF];
+      temp ^= RCON[i / 4 - 1] << 24;
+    }
+    w[i] = w[i - 4] ^ temp;
+  }
+}
+
+void SubBytes(state_t *state) {
+  int i = 0, j = 0;
+  for (i = 0; i < 4; i++) {
+    for (j = 0; j < 4; j++) {
+      (*state)[i][j] = S_BOX[(*state)[i][j]];
+    }
+  }
+}
+
+void InvSubBytes(state_t *state) {
+  int i = 0, j = 0;
+  for (i = 0; i < 4; i++) {
+    for (j = 0; j < 4; j++) {
+      (*state)[i][j] = INV_S_BOX[(*state)[i][j]];
+    }
+  }
+}
+
+void ShiftRows(state_t *state) {
+  uint8_t temp;
+  temp = (*state)[1][0];
+  (*state)[1][0] = (*state)[1][1];
+  (*state)[1][1] = (*state)[1][2];
+  (*state)[1][2] = (*state)[1][3];
+  (*state)[1][3] = temp;
+  temp = (*state)[2][0];
+  (*state)[2][0] = (*state)[2][2];
+  (*state)[2][2] = temp;
+  temp = (*state)[2][1];
+  (*state)[2][1] = (*state)[2][3];
+  (*state)[2][3] = temp;
+  temp = (*state)[3][3];
+  (*state)[3][3] = (*state)[3][2];
+  (*state)[3][2] = (*state)[3][1];
+  (*state)[3][1] = (*state)[3][0];
+  (*state)[3][0] = temp;
+}
+
+void InvShiftRows(state_t *state) {
+  uint8_t temp;
+  temp = (*state)[1][3];
+  (*state)[1][3] = (*state)[1][2];
+  (*state)[1][2] = (*state)[1][1];
+  (*state)[1][1] = (*state)[1][0];
+  (*state)[1][0] = temp;
+
+  temp = (*state)[2][0];
+  (*state)[2][0] = (*state)[2][2];
+  (*state)[2][2] = temp;
+  temp = (*state)[2][1];
+  (*state)[2][1] = (*state)[2][3];
+  (*state)[2][3] = temp;
+
+  temp = (*state)[3][0];
+  (*state)[3][0] = (*state)[3][1];
+  (*state)[3][1] = (*state)[3][2];
+  (*state)[3][2] = (*state)[3][3];
+  (*state)[3][3] = temp;
+}
+
+uint8_t galois_multiply(uint8_t a, uint8_t b) {
+  uint8_t p = 0, carry;
+  int i = 0;
+  for (i = 0; i < 8; i++) {
+    if (b & 1)
+      p ^= a;
+    b >>= 1;
+    carry = a & 0x80;
+    a <<= 1;
+    if (carry)
+      a ^= 0x1b;
+  }
+  return p;
+}
+
+void MixColumns(state_t *state) {
+  int i = 0;
+  uint8_t a, b, c, d;
+  for (i = 0; i < 4; i++) {
+    a = (*state)[i][0];
+    b = (*state)[i][1];
+    c = (*state)[i][2];
+    d = (*state)[i][3];
+
+    (*state)[i][0] =
+        galois_multiply(0x02, a) ^ galois_multiply(0x03, b) ^ c ^ d;
+    (*state)[i][1] =
+        a ^ galois_multiply(0x02, b) ^ galois_multiply(0x03, c) ^ d;
+    (*state)[i][2] =
+        a ^ b ^ galois_multiply(0x02, c) ^ galois_multiply(0x03, d);
+    (*state)[i][3] =
+        galois_multiply(0x03, a) ^ b ^ c ^ galois_multiply(0x02, d);
+  }
+}
+
+void InvMixColumns(state_t *state) {
+  uint8_t a, b, c, d;
+  int i = 0;
+  for (i = 0; i < 4; i++) {
+    a = (*state)[i][0];
+    b = (*state)[i][1];
+    c = (*state)[i][2];
+    d = (*state)[i][3];
+
+    (*state)[i][0] = galois_multiply(0x0e, a) ^ galois_multiply(0x0b, b) ^
+                     galois_multiply(0x0d, c) ^ galois_multiply(0x09, d);
+    (*state)[i][1] = galois_multiply(0x09, a) ^ galois_multiply(0x0e, b) ^
+                     galois_multiply(0x0b, c) ^ galois_multiply(0x0d, d);
+    (*state)[i][2] = galois_multiply(0x0d, a) ^ galois_multiply(0x09, b) ^
+                     galois_multiply(0x0e, c) ^ galois_multiply(0x0b, d);
+    (*state)[i][3] = galois_multiply(0x0b, a) ^ galois_multiply(0x0d, b) ^
+                     galois_multiply(0x09, c) ^ galois_multiply(0x0e, d);
+  }
+}
+
+void AddRoundKey(state_t *state, const uint32_t *w, int round) {
+  uint32_t key[4];
+  int i = 0;
+  for (i = 0; i < 4; i++) {
+    key[i] = w[round * 4 + i];
+  }
+
+  for (i = 0; i < 4; i++) {
+    (*state)[i][0] ^= (key[i] >> 24) & 0xFF;
+    (*state)[i][1] ^= (key[i] >> 16) & 0xFF;
+    (*state)[i][2] ^= (key[i] >> 8) & 0xFF;
+    (*state)[i][3] ^= key[i] & 0xFF;
+  }
+}
+
+void AES_EncryptBlock(uint8_t block[16], const uint32_t *w) {
+  state_t state;
+  int i = 0, j = 0, round = 0;
+  for (i = 0; i < 4; i++) {
+    for (j = 0; j < 4; j++) {
+      state[j][i] = block[i * 4 + j];
+    }
+  }
+
+  AddRoundKey(&state, w, 0);
+
+  for (round = 1; round <= 10; round++) {
+    SubBytes(&state);
+    ShiftRows(&state);
+    if (round != 10)
+      MixColumns(&state);
+    AddRoundKey(&state, w, round);
+  }
+
+  for (i = 0; i < 4; i++) {
+    for (j = 0; j < 4; j++) {
+      block[i * 4 + j] = state[j][i];
+    }
+  }
+}
+
+void AES_DecryptBlock(uint8_t block[16], const uint32_t *w) {
+  state_t state;
+  int i = 0, j = 0, round = 0;
+  for (i = 0; i < 4; i++) {
+    for (j = 0; j < 4; j++) {
+      state[j][i] = block[i * 4 + j];
+    }
+  }
+
+  AddRoundKey(&state, w, 10);
+
+  for (round = 9; round >= 0; round--) {
+    InvShiftRows(&state);
+    InvSubBytes(&state);
+    AddRoundKey(&state, w, round);
+    if (round != 0) {
+      InvMixColumns(&state);
+    }
+  }
+
+  for (i = 0; i < 4; i++) {
+    for (j = 0; j < 4; j++) {
+      block[i * 4 + j] = state[j][i];
+    }
+  }
+}
+
+void AES_ECB_Encrypt(uint8_t *data, const uint8_t *key) {
+  uint32_t expandedKey[44];
+  int i = 0;
+  KeyExpansion(key, expandedKey);
+
+  for (i = 0; i < 4096 / 16; i++) {
+    uint8_t *block = data + i * 16;
+    AES_EncryptBlock(block, expandedKey);
+  }
+}
+
+void AES_ECB_Decrypt(uint8_t *data, const uint8_t *key) {
+  uint32_t expandedKey[44];
+  int i = 0;
+  KeyExpansion(key, expandedKey);
+  for (i = 0; i < 4096 / 16; i++) {
+    uint8_t *block = data + i * 16;
+    AES_DecryptBlock(block, expandedKey);
+  }
+}
+//// AES-128 end
+
+//// TODO ////
 // debug, crypto page printing
 #define LINE_BUFFER_SIZE 256
 static void nvme_p2p_print_value(void *data, unsigned bufferlen, const char *name) {
@@ -990,12 +1305,12 @@ static DEFINE_SPINLOCK(xor_lock);
 
 //// TODO ////
 // for PRP, encrypt each 4KB page
-static int encrypt_data_page(void *buf) {
+static int encrypt_data_page(void *buf, uint16_t buf_size) {
 	int ret = -1;
 	char *ptr = (char *)buf;
 	size_t i = 0;
 	// spin_lock(&xor_lock);
-	for (i = 0; i < 4096; i++) {
+	for (i = 0; i < buf_size; i++) {
 		ptr[i] ^= 0x55;
 	}
 	// spin_unlock(&xor_lock);
@@ -1004,7 +1319,7 @@ static int encrypt_data_page(void *buf) {
 }
 
 // crypto key
-static const u8 key[32] = "My_AES_256bIT_KeY_0123456789.ddd"; // AES-256 key
+// static const u8 key[32] = "My_AES_256bIT_KeY_0123456789.ddd"; // AES-256 key
 // static const u8 iv[16] = "static_iv_16byte";
 
 static int data_page_aes(void *buf, bool is_encrypt) { // is_encrypt = true for encrypt, false for decrypt
@@ -1057,12 +1372,12 @@ cleanup:
 
 //// TODO ////
 // for PRP, decrypt each 4KB page
-static int decrypt_data_page(void *buf) {
+static int decrypt_data_page(void *buf, uint16_t buf_size) {
 	int ret = -1;
 	char *ptr = (char *)buf;
 	size_t i = 0;
 	// spin_lock(&xor_lock);
-	for (i = 0; i < 4096; i++) {
+	for (i = 0; i < buf_size; i++) {
 		ptr[i] ^= 0x55;
 	}
 	// spin_unlock(&xor_lock);
@@ -1089,16 +1404,31 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	const int page_size = 4096;
 	uint32_t config1;
 	uint32_t mask = 0xFFFF;
+	// ktime for debug
+	ktime_t st_time, ed_time, lap_time;
+	int i = 0;
 	// PRP1 encrypt
 	// PRP1 mem copy
 	void *old_buf = phys_to_virt(dptr->prp1);
+	// printk("----------ENCRYPT START-----------\n");
+	// printk("index: %d\n", (qid - 1) * 4 + (command_id % 4));
 	if (dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)]) { // 实际上list里的index 0才对应了qid 1，所以得-1
 #ifdef SOFTWARE
 		memcpy(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)], old_buf, page_size);
 		// new buffer encrypt
-		// printk("----------ENCRYPT START-----------\n");
 		// nvme_p2p_print_value(dev->dma_virt_list[qid], 4096, "before encrypto");
-		encrypt_data_page(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)]);
+		// st_time = ktime_get_ns();
+		// for (i = 0; i < 1024; i++) {
+		// 	uint32_t *block = (uint32_t *)(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)] + i * 4);
+		// 	encrypt_data_page(block, 4);
+		// }
+		// use aes
+		AES_ECB_Encrypt(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)], key);
+		// aes end
+		// encrypt_data_page(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)], 4096);
+		// ed_time = ktime_get_ns();
+		// lap_time = ktime_to_ns(ed_time - st_time);
+		// printk("encrypt time: %lluns\n", lap_time);
 		// data_page_aes(dev->dma_virt_list[qid], true);
 		// nvme_p2p_print_value(dev->dma_virt_list[qid], 4096, "after encrypto");
 		// end buffer encrypt
@@ -1106,6 +1436,7 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 #endif
 #ifdef FPGA
 		// FPGA encrypt
+		// st_time = ktime_get_ns();
 		memcpy_toio(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)], old_buf, page_size);
 		// read first
 		config1 = readl(dev->config_1_reg);
@@ -1117,6 +1448,9 @@ static int encrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 		// printk("mask: %x\n", mask);
 		writel(config1 | mask, dev->config_1_reg);
 		// FPGA encrypt end
+		// ed_time = ktime_get_ns();
+		// lap_time = ktime_to_ns(ed_time - st_time);
+		// printk("encrypt time: %lluns\n", lap_time);
 #endif
 	}
 	else {
@@ -1154,6 +1488,8 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	int ret = -1;
 	void *old_buf;
 	uint32_t config1, mask;
+	ktime_t st_time, ed_time, lap_time;
+	int i = 0;
 	// struct nvme_crypto_work *crypto_work = kmalloc(sizeof(*crypto_work), GFP_ATOMIC);
 	// const int page_size = 4096;
 	// printk("------READ DECRYPTION START------\n");
@@ -1168,18 +1504,31 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 	// 	crypto_work->is_encrypt = false;
 	// 	schedule_work(&crypto_work->work);
 	// }
-	decrypt_data_page(old_buf);
+	// st_time = ktime_get_ns();
+
+	// for (i = 0; i < 1024; i++) {
+	// 	uint32_t *block = (uint32_t *)(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)] + i * 4);
+	// 	decrypt_data_page(block, 4);
+	// }
+	// decrypt_data_page(old_buf, 4096);
+	
+	// use aes
+	AES_ECB_Decrypt(old_buf, key);
+	// aes end
+	// ed_time = ktime_get_ns();
+	// lap_time = ktime_to_ns(ed_time - st_time);
+	// printk("decrypt time: %lluns\n", lap_time);
 	// nvme_p2p_print_value(old_buf, 4096, "after decrypto");
 	// data_page_aes(old_buf, false);
 	// end decryption
 	// printk("Old PRP1: %d, New PRP1: %d\n", dptr->prp1, dev->dma_phys_list[qid]);
-	// printk("-------READ DECRYPTION END-------\n");
 #endif
 #ifdef FPGA
 	// FPGA decrypt
 	// printk("index: %d\n", (qid - 1) * 4 + (command_id % 4));
 	if (dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)]) {
 		// printk("index: %d\n", (qid - 1) * 4 + (command_id % 4));
+		// st_time = ktime_get_ns();
 		memcpy_toio(dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)], old_buf, 4096);
 		// read first
 		config1 = readl(dev->config_1_reg);
@@ -1191,9 +1540,13 @@ static int decrypt_prp_traversal(union nvme_data_ptr *dptr, struct nvme_dev *dev
 		// printk("mask: %x\n", mask);
 		writel(config1 | mask, dev->config_1_reg);
 		memcpy_fromio(old_buf, dev->dma_virt_list[(qid - 1) * 4 + (command_id % 4)], 4096);
+		// ed_time = ktime_get_ns();
+		// lap_time = ktime_to_ns(ed_time - st_time);
+		// printk("decrypt time: %lluns\n", lap_time);
 	}
 	// nvme_p2p_print_value(old_buf, 4096, "after decrypto");
 #endif
+	// printk("-------READ DECRYPTION END-------\n");
 	return ret;
 }
 
@@ -1226,6 +1579,7 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	blk_status_t ret;
 	// struct dma_pool *encrypt_data_pool;
+	// ktime_t	st_time, ed_time;
 
 	/*
 	 * We should not need to do this, but we're still using this to
@@ -1249,7 +1603,10 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (nvmeq->qid > 0) { // nvme I/O command, skip nvme admin command
 		if (iod->cmd.rw.opcode == nvme_cmd_write) { // write command, encrypt
 			// printk("====Write Data ENCRYPT====\n");
+			// st_time = ktime_get_ns();
 			nvme_write_data_encrypt(iod, dev, nvmeq->qid, iod->cmd.rw.command_id);
+			// ed_time = ktime_get_ns();
+			// printk("encrypt time: %llu\n", ed_time - st_time);
 			// printk("====Write Data ENCRYPT====\n");
 		} 
 		else if (iod->cmd.rw.opcode == nvme_cmd_read) { // read command, decrypt
@@ -1257,9 +1614,17 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 		}
 	}
 	// end additional logic
-
+	// st_time = ktime_get_ns();
 	nvme_sq_copy_cmd(nvmeq, &iod->cmd);
+	// ed_time = ktime_get_ns();
+	// printk("sq copy cmnd time: %llu\n", ed_time - st_time);
+	
+	// st_time = ktime_get_ns();
 	nvme_write_sq_db(nvmeq, bd->last);
+	// ed_time = ktime_get_ns();
+	// printk("write db time: %llu\n", ed_time - st_time);
+	
+	
 	spin_unlock(&nvmeq->sq_lock);
 	return BLK_STS_OK;
 }
@@ -2611,6 +2976,9 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	dev->nr_poll_queues = poll_queues;
 
 	nr_io_queues = dev->nr_allocated_queues - 1;
+#ifdef SOFTWARE
+	nr_io_queues = 4;
+#endif
 #ifdef FPGA	
 	nr_io_queues = 4; // fix to 4, for fpga test
 #endif
@@ -3409,7 +3777,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	//// TODO ////
 	// params
-	int block_nums = 96; // max 96 cpu cores, max 96 queues
+	int block_nums = 4; // max 96 cpu cores, max 96 queues
 	int qd = 4;
 	int block_size = 4096;
 	size_t i = 0;
@@ -3436,6 +3804,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	nvme_reset_ctrl(&dev->ctrl);
 	async_schedule(nvme_async_probe, dev);
 
+	dev->dma_allocated = 0;
 	//// TODO ////
 #ifdef SOFTWARE
 	// allocate global buffer for each queue ectrypt
@@ -3480,6 +3849,14 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	dev->dma_virt_list = kcalloc(block_nums * qd, sizeof(void *), GFP_KERNEL);
 	dev->dma_phys_list = kcalloc(block_nums * qd, sizeof(dma_addr_t), GFP_KERNEL);
+	if (!dev->dma_virt_list) {
+		printk("VIRT LIST alloc failed!\n");
+		return -ENOMEM;
+	}
+	if (!dev->dma_phys_list) {
+		printk("PHSY LIST alloc failed!\n");
+		return -ENOMEM;
+	}
 	for (i = 0; i < block_nums * qd; i++) {
 		dev->dma_phys_list[i] = FPGA_BRAM0_ST + i * block_size; // phys addr
 		dev->dma_virt_list[i] = fixed_virt_base + i * block_size;
@@ -3595,6 +3972,7 @@ static void nvme_remove(struct pci_dev *pdev)
 			if (dev->dma_virt_list[i]) {
 				dma_free_coherent(dev->dev, block_size, dev->dma_virt_list[i], dev->dma_phys_list[i]);
 				dev->dma_virt_list[i] = NULL;
+				// dev->dma_phys_list[i] = 0;
 			}
 		}	
 	}
@@ -3612,9 +3990,12 @@ static void nvme_remove(struct pci_dev *pdev)
 			}
 		}	
 	}
-
-	kfree(dev->dma_phys_list);
-	kfree(dev->dma_virt_list);
+	if (dev->dma_phys_list) {
+		kfree(dev->dma_phys_list);
+	}
+	if (dev->dma_virt_list) {
+		kfree(dev->dma_virt_list);
+	}
 	// free done
 #endif
 	flush_work(&dev->ctrl.reset_work);
